@@ -1,65 +1,99 @@
-import jwt from 'jsonwebtoken'; // 1. Add this import at the very top of the file!
 import { Router, Request, Response } from 'express';
+import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import { randomInt } from 'crypto';
 import { User } from '../models/User.js';
-import { sendEmail } from '../services/emailService.js'; // 1. Import our email service
+import { sendEmail } from '../services/emailService.js';
+import { authLimiter } from '../middleware/rateLimit.js';
 
 const router = Router();
+router.use(authLimiter);
+
+const OTP_TTL_MS = 10 * 60 * 1000;
+const MIN_PASSWORD_LENGTH = 8;
+const SALT_ROUNDS = 10;
+
+// crypto.randomInt is secure; Math.random is not.
+const generateOtp = (): string => randomInt(100000, 1000000).toString();
+
+const normalizeEmail = (value: unknown): string =>
+  typeof value === 'string' ? value.trim().toLowerCase() : '';
+
+const otpEmailHtml = (heading: string, intro: string, otp: string, footer: string): string => `
+  <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #eee; border-radius: 5px;">
+    <h2 style="color: #e50914;">${heading}</h2>
+    <p>${intro}</p>
+    <h1 style="background: #f4f4f4; padding: 10px; display: inline-block; letter-spacing: 4px; color: #333;">${otp}</h1>
+    <p style="color: #777; font-size: 12px;">${footer}</p>
+  </div>
+`;
 
 // @route   POST /api/auth/register
-// @desc    Register a new user and email an activation OTP
+// @desc    Create an account (or restart verification for an unverified one) and email an OTP
 router.post('/register', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, password } = req.body;
+    const email = normalizeEmail(req.body?.email);
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
 
     if (!email || !password) {
-       res.status(400).json({ success: false, message: 'Please provide both email and password.' });
-       return;
+      res.status(400).json({ success: false, message: 'Please provide both email and password.' });
+      return;
+    }
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      res.status(400).json({ success: false, message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters.` });
+      return;
     }
 
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-       res.status(400).json({ success: false, message: 'An account with this email already exists.' });
-       return;
+    const existing = await User.findOne({ email });
+    if (existing?.isVerified) {
+      res.status(409).json({ success: false, message: 'An account with this email already exists.' });
+      return;
     }
 
-    const saltRounds = 10;
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
+    const otp = generateOtp();
+    const otpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
 
-    const generatedOtp = Math.floor(100000 + Math.random() * 900000).toString();
-    const otpExpiryTime = new Date(Date.now() + 10 * 60 * 1000);
+    if (existing) {
+      // Registered earlier but never verified (e.g. the email failed). Let them start over.
+      existing.password = hashedPassword;
+      existing.otp = otp;
+      existing.otpExpiresAt = otpExpiresAt;
+      await existing.save();
+    } else {
+      await User.create({ email, password: hashedPassword, otp, otpExpiresAt });
+    }
 
-    // Create user profile
-    await User.create({
-      email,
-      password: hashedPassword,
-      otp: generatedOtp,
-      otpExpiresAt: otpExpiryTime,
-    });
-
-    // 2. Dispatch Welcome Verification Email asynchronously
-    await sendEmail({
+    const sent = await sendEmail({
       to: email,
-      subject: 'Welcome to CineSnackHub! Verify Your Account🍿',
-      text: `Welcome onboard! Your 6-digit verification code is: ${generatedOtp}. It expires in 10 minutes.`,
-      html: `
-        <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #eee; border-radius: 5px;">
-          <h2 style="color: #e50914;">Welcome to CineSnackHub! 🍿</h2>
-          <p>Thank you for signing up. Let's get your cinematic journey started!</p>
-          <p>Your one-time verification code is:</p>
-          <h1 style="background: #f4f4f4; padding: 10px; display: inline-block; letter-spacing: 4px; color: #333;">${generatedOtp}</h1>
-          <p style="color: #777; font-size: 12px;">This code is valid for exactly 10 minutes.</p>
-        </div>
-      `,
+      subject: 'Welcome to CineSnackHub! Verify Your Account 🍿',
+      text: `Your 6-digit verification code is: ${otp}. It expires in 10 minutes.`,
+      html: otpEmailHtml(
+        'Welcome to CineSnackHub! 🍿',
+        'Thanks for signing up. Your one-time verification code is:',
+        otp,
+        'This code is valid for 10 minutes.'
+      ),
     });
+
+    if (!sent) {
+      res.status(502).json({
+        success: false,
+        message: 'We could not send the verification email. Please try again in a moment.',
+      });
+      return;
+    }
 
     res.status(201).json({
       success: true,
-      message: 'Account created successfully! A verification OTP has been sent straight to your email inbox.',
+      message: 'Account created! A verification code has been sent to your email.',
     });
-
-  } catch (error) {
-    console.error('Registration processing error:', error);
+  } catch (error: any) {
+    if (error?.code === 11000) {
+      res.status(409).json({ success: false, message: 'An account with this email already exists.' });
+      return;
+    }
+    console.error('Registration error:', error);
     res.status(500).json({ success: false, message: 'Internal server registration failure.' });
   }
 });
@@ -67,7 +101,8 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
 // @route   POST /api/auth/verify-otp
 router.post('/verify-otp', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, otp } = req.body;
+    const email = normalizeEmail(req.body?.email);
+    const otp = typeof req.body?.otp === 'string' ? req.body.otp.trim() : '';
 
     if (!email || !otp) {
       res.status(400).json({ success: false, message: 'Please provide both email and OTP.' });
@@ -79,17 +114,14 @@ router.post('/verify-otp', async (req: Request, res: Response): Promise<void> =>
       res.status(404).json({ success: false, message: 'Account not found.' });
       return;
     }
-
     if (user.isVerified) {
       res.status(400).json({ success: false, message: 'This account is already verified. Please log in.' });
       return;
     }
-
     if (!user.otpExpiresAt || user.otpExpiresAt < new Date()) {
-      res.status(400).json({ success: false, message: 'Your OTP has expired. Please request a new one.' });
+      res.status(400).json({ success: false, message: 'Your OTP has expired. Please register again to get a new one.' });
       return;
     }
-
     if (user.otp !== otp) {
       res.status(400).json({ success: false, message: 'Invalid OTP code. Please check and try again.' });
       return;
@@ -100,25 +132,28 @@ router.post('/verify-otp', async (req: Request, res: Response): Promise<void> =>
     user.otpExpiresAt = null;
     await user.save();
 
-    res.status(200).json({
-      success: true,
-      message: 'Account verified successfully! Welcome to CineSnackHub. 🎉',
-    });
-
+    res.status(200).json({ success: true, message: 'Account verified! Welcome to CineSnackHub. 🎉' });
   } catch (error) {
-    console.error('OTP Verification error:', error);
+    console.error('OTP verification error:', error);
     res.status(500).json({ success: false, message: 'Internal server verification failure.' });
   }
 });
 
 // @route   POST /api/auth/login
-// @desc    Authenticate user and generate a secure session token
 router.post('/login', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, password } = req.body;
+    const email = normalizeEmail(req.body?.email);
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
 
     if (!email || !password) {
       res.status(400).json({ success: false, message: 'Please provide both email and password.' });
+      return;
+    }
+
+    const secret = process.env.JWT_SECRET;
+    if (!secret) {
+      console.error('JWT_SECRET is missing in .env');
+      res.status(500).json({ success: false, message: 'Server is not configured correctly.' });
       return;
     }
 
@@ -128,90 +163,73 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    if (!user.isVerified) {
-      res.status(403).json({ 
-        success: false, 
-        message: 'Your account is not verified yet. Please verify your email using your OTP first.' 
-      });
-      return;
-    }
-
-    const isPasswordMatch = await bcrypt.compare(password, user.password);
-    if (!isPasswordMatch) {
+    const passwordMatches = await bcrypt.compare(password, user.password);
+    if (!passwordMatches) {
       res.status(401).json({ success: false, message: 'Invalid email or password.' });
       return;
     }
 
-    // 2. Generate a secure JWT Token
-    // We embed the user's ID inside it and make it expire in 3 days
-    const token = jwt.sign(
-      { userId: user._id },
-      process.env.JWT_SECRET || 'fallback_secret',
-      { expiresIn: '3d' }
-    );
+    // Checked after the password so strangers can't probe which emails are unverified.
+    if (!user.isVerified) {
+      res.status(403).json({
+        success: false,
+        message: 'Your account is not verified yet. Please verify your email with the OTP first.',
+      });
+      return;
+    }
 
-    // 3. Return the token to the client alongside user data
+    const token = jwt.sign({ userId: user._id }, secret, { expiresIn: '3d' });
+
     res.status(200).json({
       success: true,
       message: 'Login successful! Welcome back to CineSnackHub. 🍿',
-      token, // <-- The client will save this string to stay logged in
-      user: {
-        id: user._id,
-        email: user.email,
-        subscriptionPlan: user.subscriptionPlan,
-      }
+      token,
+      user: { id: user._id, email: user.email, subscriptionPlan: user.subscriptionPlan },
     });
-
   } catch (error) {
-    console.error('Login processing error:', error);
+    console.error('Login error:', error);
     res.status(500).json({ success: false, message: 'Internal server login failure.' });
   }
 });
 
 // @route   POST /api/auth/forgot-password
-// @desc    Generate and email a recovery OTP for a forgotten password
 router.post('/forgot-password', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email } = req.body;
-
+    const email = normalizeEmail(req.body?.email);
     if (!email) {
       res.status(400).json({ success: false, message: 'Please provide an email address.' });
       return;
     }
 
     const user = await User.findOne({ email });
-    
-    if (user) {
-      const generatedOtp = Math.floor(100000 + Math.random() * 900000).toString();
-      const expiryTime = new Date(Date.now() + 10 * 60 * 1000);
 
-      user.otp = generatedOtp;
-      user.otpExpiresAt = expiryTime;
+    // Only verified accounts get a reset code. The response is identical either way.
+    if (user && user.isVerified) {
+      const otp = generateOtp();
+      user.otp = otp;
+      user.otpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
       await user.save();
 
-      // 3. Dispatch Password Recovery Email asynchronously
-      await sendEmail({
+      const sent = await sendEmail({
         to: email,
         subject: 'Reset Your CineSnackHub Password 🔐',
-        text: `You requested a password reset. Your 6-digit recovery code is: ${generatedOtp}.`,
-        html: `
-          <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #eee; border-radius: 5px;">
-            <h2 style="color: #e50914;">Password Recovery Request</h2>
-            <p>We received a request to reset your password. Use the code below to complete your recovery:</p>
-            <h1 style="background: #f4f4f4; padding: 10px; display: inline-block; letter-spacing: 4px; color: #e50914;">${generatedOtp}</h1>
-            <p style="color: #777; font-size: 12px;">If you didn't request this, you can safely ignore this email.</p>
-          </div>
-        `,
+        text: `Your 6-digit recovery code is: ${otp}. It expires in 10 minutes.`,
+        html: otpEmailHtml(
+          'Password Recovery Request',
+          'Use the code below to reset your password:',
+          otp,
+          "If you didn't request this, you can safely ignore this email."
+        ),
       });
+      if (!sent) console.error(`Password reset email failed for ${email}`);
     }
 
     res.status(200).json({
       success: true,
-      message: 'If that email matches an account, a recovery OTP has been sent.',
+      message: 'If that email matches an account, a recovery code has been sent.',
     });
-
   } catch (error) {
-    console.error('Forgot password processing failure:', error);
+    console.error('Forgot password error:', error);
     res.status(500).json({ success: false, message: 'Internal server processing error.' });
   }
 });
@@ -219,43 +237,44 @@ router.post('/forgot-password', async (req: Request, res: Response): Promise<voi
 // @route   POST /api/auth/reset-password
 router.post('/reset-password', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, otp, newPassword } = req.body;
+    const email = normalizeEmail(req.body?.email);
+    const otp = typeof req.body?.otp === 'string' ? req.body.otp.trim() : '';
+    const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
 
     if (!email || !otp || !newPassword) {
       res.status(400).json({ success: false, message: 'Please fill in all recovery fields.' });
       return;
     }
+    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+      res.status(400).json({ success: false, message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters.` });
+      return;
+    }
 
     const user = await User.findOne({ email });
-    if (!user) {
-      res.status(400).json({ success: false, message: 'Invalid or expired password reset parameters.' });
+    if (!user || !user.isVerified) {
+      res.status(400).json({ success: false, message: 'Invalid or expired password reset details.' });
       return;
     }
-
     if (!user.otpExpiresAt || user.otpExpiresAt < new Date()) {
-      res.status(400).json({ success: false, message: 'Recovery window has expired. Request a new OTP.' });
+      res.status(400).json({ success: false, message: 'Recovery code has expired. Request a new one.' });
       return;
     }
-
     if (user.otp !== otp) {
-      res.status(400).json({ success: false, message: 'Incorrect recovery OTP code.' });
+      res.status(400).json({ success: false, message: 'Incorrect recovery code.' });
       return;
     }
 
-    const saltRounds = 10;
-    user.password = await bcrypt.hash(newPassword, saltRounds);
-
+    user.password = await bcrypt.hash(newPassword, SALT_ROUNDS);
     user.otp = null;
     user.otpExpiresAt = null;
     await user.save();
 
     res.status(200).json({
       success: true,
-      message: 'Password updated successfully! You can now log in with your new credentials. 🔐',
+      message: 'Password updated! You can now log in with your new password. 🔐',
     });
-
   } catch (error) {
-    console.error('Reset password processing failure:', error);
+    console.error('Reset password error:', error);
     res.status(500).json({ success: false, message: 'Internal server recovery failure.' });
   }
 });

@@ -1,50 +1,73 @@
-import { Router, Request, Response } from 'express';
+import { Router, Response } from 'express';
+import { Movie } from '../models/Movie.js';
+import { requireAuth, AuthedRequest } from '../middleware/auth.js';
+import { aiLimiter } from '../middleware/rateLimit.js';
+import { pickMoviesForMood, keywordFallback, CatalogEntry, AiResult } from '../services/aiService.js';
 
 const router = Router();
 
-// A flat semantic search database collection representing our catalog index
-const CATALOG_INDEX = [
-  { id: 1, title: "Interstellar Odyssey", keywords: ["lonely", "sad", "space", "adventure", "sci-fi", "stars", "wormhole"] },
-  { id: 2, title: "The Neon Samurai", keywords: ["hyped", "action", "cyberpunk", "tokyo", "samurai", "fight", "futuristic"] },
-  { id: 3, title: "Midnight Gourmet", keywords: ["anxious", "tired", "chill", "food", "chef", "cooking", "feelgood", "comedy"] },
-  { id: 4, title: "Chronicles of Eloria", keywords: ["bored", "fantasy", "magic", "epic", "adventure", "monsters", "swords"] },
-  { id: 5, title: "Deep Sea Protocol", keywords: ["scared", "thriller", "ocean", "submarine", "suspense", "monster", "dark"] }
-];
+const MAX_QUERY_LENGTH = 300;
+const MAX_CATALOG_SIZE = 200; // fine for a small catalog; use Atlas Vector Search once you pass this
 
 // @route   POST /api/search/ai-query
-// @desc    Analyze natural mood strings and match semantic library keywords
-router.post('/ai-query', async (req: Request, res: Response): Promise<void> => {
+// @desc    Turn a mood or plot description into movie suggestions from the Atlas catalog
+router.post('/ai-query', requireAuth, aiLimiter, async (req: AuthedRequest, res: Response): Promise<void> => {
   try {
-    const { query } = req.body;
+    const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
 
     if (!query) {
-      res.status(400).json({ success: false, message: 'Please provide a search or mood description.' });
+      res.status(400).json({ success: false, message: 'Please describe your mood or what you want to watch.' });
+      return;
+    }
+    if (query.length > MAX_QUERY_LENGTH) {
+      res.status(400).json({ success: false, message: `Please keep it under ${MAX_QUERY_LENGTH} characters.` });
       return;
     }
 
-    const cleanQuery = query.toLowerCase();
+    const movies = await Movie.find().limit(MAX_CATALOG_SIZE).lean();
+    if (movies.length === 0) {
+      res.status(200).json({ success: true, reply: 'The catalog is empty. Run the seed script first.', results: [], source: 'none' });
+      return;
+    }
 
-    // ⚡ SEMANTIC AI MATCH SIMULATOR: Tokenizes input string and aggregates keyword hit-rates
-    const matches = CATALOG_INDEX.map(movie => {
-      const matchScore = movie.keywords.reduce((score, keyword) => {
-        return cleanQuery.includes(keyword) ? score + 1 : score;
-      }, 0);
-      return { id: movie.id, score: matchScore };
-    })
-    .filter(item => item.score > 0) // Keep titles that matched at least one prompt word
-    .sort((a, b) => b.score - a.score); // Order by highest AI matching relevance score
+    const catalog: CatalogEntry[] = movies.map((m) => ({
+      id: String(m._id),
+      title: m.title,
+      genres: m.genres ?? [],
+      moods: m.moods ?? [],
+      plot: m.plot,
+      rating: m.rating ?? 0,
+    }));
 
-    const matchedIds = matches.map(m => m.id);
+    let result: AiResult;
+    let source: 'ai' | 'keyword' = 'ai';
+    try {
+      result = await pickMoviesForMood(query, catalog);
+    } catch (aiError) {
+      console.error('Gemini failed, using keyword fallback:', aiError);
+      result = keywordFallback(query, catalog);
+      source = 'keyword';
+    }
 
-    res.status(200).json({
-      success: true,
-      message: `AI analysis complete for query parameters. Found ${matchedIds.length} relevant titles.`,
-      matchedMovieIds: matchedIds // Passes back structural array of matching catalog IDs
+    const byId = new Map(movies.map((m) => [String(m._id), m]));
+    const results = result.picks.flatMap((pick) => {
+      const m = byId.get(pick.id);
+      if (!m) return [];
+      return [{
+        id: String(m._id),
+        title: m.title,
+        genre: (m.genres ?? []).join(' / '),
+        posterUrl: m.backdropUrl || m.posterUrl,
+        rating: m.rating ?? 0,
+        plot: m.plot,
+        reason: pick.reason,
+      }];
     });
 
+    res.status(200).json({ success: true, reply: result.reply, results, source });
   } catch (error) {
-    console.error('❌ AI query search engine failure:', error);
-    res.status(500).json({ success: false, message: 'Internal AI routing node mismatch.' });
+    console.error('AI query search failure:', error);
+    res.status(500).json({ success: false, message: 'Search failed. Please try again.' });
   }
 });
 

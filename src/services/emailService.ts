@@ -1,48 +1,61 @@
 import nodemailer from 'nodemailer';
-import dotenv from 'dotenv';
+import type { Transporter } from 'nodemailer';
 
-dotenv.config();
+let transporter: Transporter | null = null;
 
-//Create a reusable transporter object using environmental mail credentials 
-const transporter = nodemailer.createTransport({
-  host: process.env.EMAIL_HOST || 'smtp.ethereal.email', // Defaults to a fake testing server if blank
-  port: Number(process.env.EMAIL_PORT) || 587,
-  auth: {
-    user: process.env.EMAIL_USER || '',
-    pass: process.env.EMAIL_PASS || '',
-  },
-});
+// Built on first use so .env is always loaded by then.
+const getTransporter = (): Transporter => {
+  if (!transporter) {
+    const port = Number(process.env.EMAIL_PORT) || 587;
+
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+      console.warn('EMAIL_USER or EMAIL_PASS is empty in .env, emails will fail to send.');
+    }
+
+    transporter = nodemailer.createTransport({
+      host: process.env.EMAIL_HOST || 'smtp.ethereal.email',
+      port,
+      secure: port === 465, // 465 = implicit TLS, 587 = STARTTLS
+      auth: {
+        user: process.env.EMAIL_USER || '',
+        pass: process.env.EMAIL_PASS || '',
+      },
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 15_000,
+    });
+  }
+  return transporter;
+};
 
 interface SendEmailOptions {
-  to : string,
-  subject: string,
-  text: string,
-  html: string,
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
 }
 
-//Reusable function to dispatch emails anywhere across our backend application
+// Returns true when the mail server accepted the message, false otherwise.
+// Callers MUST check the result.
 export const sendEmail = async (options: SendEmailOptions): Promise<boolean> => {
- try{
-  const mailOptions = {
-    from: `"CineSnackHub" <${process.env.EMAIL_USER || 'no-reply@cinesnackhub.com'}>`,
-    to: options.to,
-    subject: options.subject,
-    text: options.text,
-    html: options.html,
-  };
+  try {
+    const info = await getTransporter().sendMail({
+      from: `"CineSnackHub" <${process.env.EMAIL_USER || 'no-reply@cinesnackhub.com'}>`,
+      to: options.to,
+      subject: options.subject,
+      text: options.text,
+      html: options.html,
+    });
 
-  const info = await transporter.sendMail(mailOptions);
-  console.log(`Email dispatched successfully! MessageID: ${info.messageId}`);
+    console.log(`Email dispatched. MessageID: ${info.messageId}`);
 
-  // For local testing: Ethereal prints a URL where you can view your fake sent email
-  if (process.env.EMAIL_HOST?.includes('ethereal.email')) {
-    console.log(`Preview URL: ${nodemailer.getTestMessageUrl(info)}`);
+    // Ethereal (fake test inbox) prints a preview link instead of delivering.
+    if (process.env.EMAIL_HOST?.includes('ethereal.email')) {
+      console.log(`Preview URL: ${nodemailer.getTestMessageUrl(info)}`);
+    }
+    return true;
+  } catch (error) {
+    console.error('Email dispatch failed:', error);
+    return false;
   }
-
-  return true;
-
- } catch (error) {
-  console.error('Email dispatch operation failed:', error);
-  return false;
- }
-}
+};
