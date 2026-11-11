@@ -43,7 +43,7 @@ export async function pickMoviesForMood(query: string, catalog: CatalogEntry[]):
   if (!ai) throw new Error('GEMINI_API_KEY is not set');
 
   const response = await ai.models.generateContent({
-    model: process.env.GEMINI_MODEL || 'gemini-3-pro',
+    model: process.env.GEMINI_MODEL || 'gemini-3.8-flash-tts',
     contents: `Viewer message: """${query}"""\n\nCatalog (JSON):\n${JSON.stringify(catalog)}`,
     config: {
       systemInstruction: SYSTEM_INSTRUCTION,

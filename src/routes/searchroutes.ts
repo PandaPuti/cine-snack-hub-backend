@@ -35,7 +35,7 @@ router.post('/ai-query', requireAuth, aiLimiter, async (req: AuthedRequest, res:
       title: m.title,
       genres: m.genres ?? [],
       moods: m.moods ?? [],
-      plot: m.plot,
+      plot: m.plot.slice(0, 160),
       rating: m.rating ?? 0,
     }));
 

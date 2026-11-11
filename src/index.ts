@@ -4,6 +4,7 @@ import mongoose from 'mongoose';
 import cors from 'cors';
 import authRoutes from './routes/authRoutes.js';
 import searchRoutes from './routes/searchroutes.js';
+import movieRoutes from './routes/movieRoutes.js';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -17,6 +18,7 @@ app.use(express.json({ limit: '10kb' }));
 
 app.use('/api/auth', authRoutes);
 app.use('/api/search', searchRoutes);
+app.use('/api/movies', movieRoutes);
 
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
